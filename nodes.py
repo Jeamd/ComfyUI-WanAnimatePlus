@@ -1808,6 +1808,10 @@ class WanAnimatePlusSCAIL2Embeds:
                 "prefix_frames": ("IMAGE", {"tooltip": "Optional prefix images. In single-frame prefix mode these are encoded as reference latents; in legacy mode they hard-freeze the beginning of the canvas."}),
                 "prefix_mask": ("IMAGE", {"tooltip": "Optional colored mask images matching prefix_frames. In single-frame prefix mode this follows the reference-mask path; in legacy canvas-prefix mode it is expanded as 1+4+4... and written into the prefix mask frames."}),
                 "transition_video": ("IMAGE", {"tooltip": "Optional transition frames to hard-freeze at the beginning of the canvas. In legacy canvas-prefix mode, transition frames are placed after the prefix frames."}),
+                "start_anchor_frames": ("IMAGE", {"tooltip": "Optional temporal start anchor for FLF2V-style endpoint conditioning. Connect the same 4n+1 frame sequence to start_anchor_frames and end_anchor_frames to make a loopable segment."}),
+                "end_anchor_frames": ("IMAGE", {"tooltip": "Optional temporal end anchor for FLF2V-style endpoint conditioning. The final SCAIL-2 window generates toward these frames instead of appending them after decode."}),
+                "endpoint_frame_count": ("INT", {"default": 5, "min": 1, "max": 21, "step": 4, "tooltip": "Maximum anchor frames used from each input. Effective count is normalized down to 4n+1; 5 is recommended for SCAIL-2."}),
+                "endpoint_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Latent endpoint lock strength. Use 1.0 for repeatable segment boundaries."}),
                 "pose_image_mask": ("IMAGE", {"tooltip": "SCAIL-2 colored per-identity driving pose mask. Background is normalized to black in animation mode and white in replacement mode."}),
                 "reference_image_mask": ("IMAGE", {"tooltip": "SCAIL-2 colored per-identity reference mask image. Background is normalized to white in animation mode and black in replacement mode."}),
                 "tiled_vae": ("BOOLEAN", {"default": False, "tooltip": "Use tiled VAE encoding for reduced memory use"}),
@@ -1938,6 +1942,59 @@ class WanAnimatePlusSCAIL2Embeds:
         return torch.cat([images[:1].repeat(count - images.shape[0], 1, 1, 1), images], dim=0)
 
     @staticmethod
+    def _prepare_endpoint_frames(images, requested_count, total_frames, use_tail, name):
+        if images is None:
+            return None
+        if images.shape[0] <= 0:
+            raise ValueError(f"SCAIL-2 {name} must contain at least one frame")
+        count = min(int(images.shape[0]), max(1, int(requested_count)), max(1, int(total_frames)))
+        valid_count = ((count - 1) // 4) * 4 + 1
+        if valid_count != count:
+            log.warning(
+                f"SCAIL-2 {name} requested {count} frames; using {valid_count} frames so the endpoint is 4n+1 aligned"
+            )
+        frames = images[-valid_count:] if use_tail else images[:valid_count]
+        return frames[:, :, :, :3]
+
+    @staticmethod
+    def _merge_sparse_freeze(base_latents, base_mask, anchor_latents, anchor_mask, target_latents):
+        if anchor_latents is None or anchor_mask is None:
+            return base_latents, base_mask
+        anchor_latents = anchor_latents[:, :target_latents]
+        anchor_mask = anchor_mask[:target_latents]
+        if base_latents is None:
+            base_latents = torch.zeros(
+                anchor_latents.shape[0], target_latents, anchor_latents.shape[2], anchor_latents.shape[3],
+                device=anchor_latents.device, dtype=anchor_latents.dtype,
+            )
+            base_mask = torch.zeros(
+                target_latents, anchor_latents.shape[2], anchor_latents.shape[3],
+                device=anchor_latents.device, dtype=anchor_latents.dtype,
+            )
+        else:
+            if base_latents.shape[1] < target_latents:
+                pad = torch.zeros(
+                    base_latents.shape[0], target_latents - base_latents.shape[1],
+                    base_latents.shape[2], base_latents.shape[3],
+                    device=base_latents.device, dtype=base_latents.dtype,
+                )
+                base_latents = torch.cat([base_latents, pad], dim=1)
+            if base_mask.shape[0] < target_latents:
+                pad = torch.zeros(
+                    target_latents - base_mask.shape[0], base_mask.shape[1], base_mask.shape[2],
+                    device=base_mask.device, dtype=base_mask.dtype,
+                )
+                base_mask = torch.cat([base_mask, pad], dim=0)
+        indices = (anchor_mask > 0).nonzero(as_tuple=True)[0]
+        copy_len = min(int(indices.numel()), int(anchor_latents.shape[1]))
+        if copy_len > 0:
+            indices = indices[:copy_len]
+            strength = anchor_mask[indices].view(copy_len, 1, 1).to(base_mask)
+            base_latents[:, indices] = anchor_latents[:, :copy_len].to(base_latents)
+            base_mask[indices] = torch.maximum(base_mask[indices], strength.expand_as(base_mask[indices]))
+        return base_latents, base_mask
+
+    @staticmethod
     def _build_prefix_pixels(prefix_frames):
         pf = prefix_frames[:, :, :, :3]
         if pf.shape[0] > 5:
@@ -2042,7 +2099,8 @@ class WanAnimatePlusSCAIL2Embeds:
                 replacement_mode, clip_embeds=None, ref_image=None, bg_image=None, pose_images=None, prefix_frames=None, prefix_mask=None,
                 transition_video=None, pose_image_mask=None, reference_image_mask=None, tiled_vae=False,
                 transition_colormatch='disabled', prefix_alpha_crop=False, preserve_main_ref_background=True,
-                single_frame_prefix_encoding=True, loop_colormatch_reference='previous_matched_frame', **kwargs):
+                single_frame_prefix_encoding=True, loop_colormatch_reference='previous_matched_frame',
+                start_anchor_frames=None, end_anchor_frames=None, endpoint_frame_count=5, endpoint_strength=1.0, **kwargs):
         W = (width // 32) * 32
         H = (height // 32) * 32
         raw_num_frames = max(1, int(num_frames))
@@ -2077,6 +2135,35 @@ class WanAnimatePlusSCAIL2Embeds:
             frame_window_size = _clamp_window_to_requested(frame_window_size, requested_frames)
             scail2_looping = frame_window_size != requested_frames
         num_frames = requested_frames
+
+        endpoints_active = start_anchor_frames is not None or end_anchor_frames is not None
+        if endpoints_active and transition_video is not None:
+            raise ValueError(
+                "SCAIL-2 start/end anchors cannot be combined with transition_video. "
+                "Use endpoint anchors for independent loopable segments, or transition_video for recursive continuation."
+            )
+        if endpoints_active and not single_frame_prefix_encoding:
+            raise ValueError("SCAIL-2 start/end anchors require single_frame_prefix_encoding=True")
+        if endpoints_active and transition_colormatch != 'disabled':
+            log.warning(
+                "SCAIL-2 endpoint anchors disable transition_colormatch because post-decode color matching "
+                "would alter the anchored boundary frames"
+            )
+            transition_colormatch = 'disabled'
+        endpoint_strength = max(0.0, min(1.0, float(endpoint_strength)))
+        start_anchor_frames = self._prepare_endpoint_frames(
+            start_anchor_frames, endpoint_frame_count, requested_frames, False, "start_anchor_frames"
+        )
+        end_anchor_frames = self._prepare_endpoint_frames(
+            end_anchor_frames, endpoint_frame_count, requested_frames, True, "end_anchor_frames"
+        )
+        start_anchor_count = int(start_anchor_frames.shape[0]) if start_anchor_frames is not None else 0
+        end_anchor_count = int(end_anchor_frames.shape[0]) if end_anchor_frames is not None else 0
+        if start_anchor_count + end_anchor_count > requested_frames:
+            raise ValueError(
+                f"SCAIL-2 endpoint anchors overlap: {start_anchor_count} start + {end_anchor_count} end frames "
+                f"exceed the {requested_frames}-frame output"
+            )
         bg_prefix_mask_pixel_frames = 0
         bg_prefix_mask_index = None
         crop_main_ref_background = (not replacement_mode) and (not preserve_main_ref_background)
@@ -2376,6 +2463,72 @@ class WanAnimatePlusSCAIL2Embeds:
         else:
             scail_prefix_prepend_latents = 0
 
+        start_anchor_latents = end_anchor_latents = None
+        if endpoint_strength > 0.0:
+            if start_anchor_frames is not None:
+                start_anchor_latents, _ = self._encode_freeze_latents(
+                    vae,
+                    start_anchor_frames,
+                    W,
+                    H,
+                    (start_anchor_count - 1) // 4 + 1,
+                    tiled_vae,
+                    frame_mask=torch.ones(start_anchor_count, device=device, dtype=vae.dtype),
+                )
+                start_anchor_latents = start_anchor_latents.to(offload_device)
+                log.info(
+                    f"SCAIL-2 start endpoint anchor: {start_anchor_count} pixel frames, "
+                    f"{start_anchor_latents.shape[1]} latent frames, strength={endpoint_strength:.3f}"
+                )
+            if end_anchor_frames is not None:
+                end_anchor_latents, _ = self._encode_freeze_latents(
+                    vae,
+                    end_anchor_frames,
+                    W,
+                    H,
+                    (end_anchor_count - 1) // 4 + 1,
+                    tiled_vae,
+                    frame_mask=torch.ones(end_anchor_count, device=device, dtype=vae.dtype),
+                )
+                end_anchor_latents = end_anchor_latents.to(offload_device)
+                log.info(
+                    f"SCAIL-2 end endpoint anchor: {end_anchor_count} pixel frames, "
+                    f"{end_anchor_latents.shape[1]} latent frames, strength={endpoint_strength:.3f}"
+                )
+
+        # One-shot SCAIL-2 has no chunk-local sampler path, so merge endpoint anchors into
+        # its sparse global freeze tensor. Loop mode keeps the small anchor tensors separate
+        # and places them only in the first/final chunk to avoid allocating a full long-video latent.
+        if not scail2_looping and endpoint_strength > 0.0:
+            endpoint_zero_mask = torch.zeros(target_latents, device=device, dtype=torch.bool)
+            if start_anchor_latents is not None:
+                frame_mask = torch.zeros(num_frames, device=device, dtype=vae.dtype)
+                frame_mask[:start_anchor_count] = endpoint_strength
+                latent_mask = self._frame_mask_to_latent_mask(frame_mask, target_latents).to(vae.dtype) * endpoint_strength
+                scail_freeze_latents, scail_freeze_mask = self._merge_sparse_freeze(
+                    scail_freeze_latents, scail_freeze_mask, start_anchor_latents.to(device), latent_mask, target_latents
+                )
+                endpoint_zero_mask |= latent_mask > 0
+            if end_anchor_latents is not None:
+                frame_mask = torch.zeros(num_frames, device=device, dtype=vae.dtype)
+                frame_mask[-end_anchor_count:] = endpoint_strength
+                latent_mask = self._frame_mask_to_latent_mask(frame_mask, target_latents).to(vae.dtype) * endpoint_strength
+                scail_freeze_latents, scail_freeze_mask = self._merge_sparse_freeze(
+                    scail_freeze_latents, scail_freeze_mask, end_anchor_latents.to(device), latent_mask, target_latents
+                )
+                endpoint_zero_mask |= latent_mask > 0
+            if scail_freeze_latents is not None:
+                scail_freeze_latents = scail_freeze_latents.to(offload_device)
+                scail_freeze_mask = scail_freeze_mask.to(offload_device)
+                if scail_condition_zero_mask is None:
+                    scail_condition_zero_mask = endpoint_zero_mask.to(offload_device)
+                else:
+                    zero_mask = torch.zeros(target_latents, device=offload_device, dtype=torch.bool)
+                    copy_len = min(target_latents, scail_condition_zero_mask.shape[0])
+                    zero_mask[:copy_len] = scail_condition_zero_mask[:copy_len].to(offload_device, dtype=torch.bool)
+                    zero_mask |= endpoint_zero_mask.to(offload_device)
+                    scail_condition_zero_mask = zero_mask
+
         if transition_px_range is not None:
             trans_start, trans_end = transition_px_range
             trans_end = min(trans_end, num_frames)
@@ -2502,7 +2655,14 @@ class WanAnimatePlusSCAIL2Embeds:
             "scail2_transition_colormatch": transition_colormatch,
             "scail2_loop_colormatch_reference": loop_colormatch_reference,
             "scail2_has_transition_video": transition_video is not None,
+            "scail2_endpoint_strength": endpoint_strength,
         }
+        if scail2_looping and start_anchor_latents is not None:
+            image_embeds["scail2_start_anchor_latents"] = start_anchor_latents
+            image_embeds["scail2_start_anchor_frames"] = start_anchor_count
+        if scail2_looping and end_anchor_latents is not None:
+            image_embeds["scail2_end_anchor_latents"] = end_anchor_latents
+            image_embeds["scail2_end_anchor_frames"] = end_anchor_count
         if transition_match_ref is not None:
             image_embeds["scail2_transition_match_ref"] = transition_match_ref.to(offload_device)
         if transition_raw_last_frame is not None:

@@ -219,6 +219,8 @@ Creates SCAIL-2 conditioning for WanAnimatePlus sampling. Use this node with SCA
 | `single_frame_prefix_encoding` | Encodes `prefix_frames` as individual full-resolution reference latents instead of expanding the canvas; enabled by default |
 | `prefix_frames` | Optional prefix images. In default single-frame mode these become reference-stream latents; with single-frame mode disabled they hard-freeze the front canvas |
 | `transition_video` | Optional transition frames to hard-freeze at the front of the latent sequence |
+| `start_anchor_frames` / `end_anchor_frames` | Optional FLF2V-style temporal endpoints. Connect the same `4n+1` frame sequence to both inputs for an independently generated loopable segment |
+| `endpoint_frame_count` / `endpoint_strength` | Maximum endpoint frames and latent lock strength; `5` / `1.0` is recommended |
 | `clip_embeds` | Optional CLIP vision features from `WanAnimatePlus ClipVisionEncode` |
 | `force_offload` / `tiled_vae` | Memory controls for VAE encoding |
 
@@ -229,6 +231,8 @@ For short generations, context windows are optional. For long generations or low
 For SCAIL-2, the default `single_frame_prefix_encoding` mode does not expand or trim the output for `prefix_frames`. If `transition_video` is connected, the front canvas expands by 21 pixel frames and those 21 frames are trimmed after decoding. With `single_frame_prefix_encoding` disabled, `prefix_frames` use the legacy 37 front pixel-frame canvas layout, with transition frames placed at frames 17-36 when `transition_video` is also connected.
 
 When `bg_image` is connected in animation mode, the node internally adds a white mask for that background image. User-provided `prefix_frames` and `prefix_mask` are limited to four images each so the background can occupy the remaining reference/prefix capacity. In replacement mode, `bg_image` is ignored.
+
+Endpoint anchors participate in denoising as frozen latents; they are not pasted onto decoded output. In long-video loop mode the start anchor is placed only in the first chunk, the end anchor only in the final chunk, and hidden latents after the requested endpoint are held at the final anchor state so the model does not see a random future. Endpoint mode disables post-decode color matching, cannot be combined with `transition_video`, and requires `single_frame_prefix_encoding=True`. Anchor input is normalized down to `4n+1` frames; use 5 frames and matching start/end driving poses for the first test.
 
 ### WanAnimatePlus SCAIL_2 Flow Embeds / Flow Sampler / VAE Decode
 

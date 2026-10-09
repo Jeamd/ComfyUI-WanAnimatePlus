@@ -2997,6 +2997,11 @@ class WanVideoSampler:
 
             freeze_latents_global = image_embeds.get("scail_freeze_latents", None)
             freeze_mask_global = image_embeds.get("scail_freeze_mask", None)
+            start_anchor_latents_global = image_embeds.get("scail2_start_anchor_latents", None)
+            end_anchor_latents_global = image_embeds.get("scail2_end_anchor_latents", None)
+            start_anchor_frame_count = int(image_embeds.get("scail2_start_anchor_frames", 0) or 0)
+            end_anchor_frame_count = int(image_embeds.get("scail2_end_anchor_frames", 0) or 0)
+            endpoint_strength = max(0.0, min(1.0, float(image_embeds.get("scail2_endpoint_strength", 1.0))))
             scail_condition_zero_mask_global = image_embeds.get("scail_condition_zero_mask", None)
             scail_sam_keep_mask_global = image_embeds.get("scail_sam_keep_mask", None)
             scail_transition_keep_mask_global = image_embeds.get("scail_transition_keep_mask", None)
@@ -3570,9 +3575,62 @@ class WanVideoSampler:
                 )
                 return gen_video
 
-            def _make_local_freeze(global_latents, global_mask, chunk_start, prev_anchor_latents, first_chunk):
+            def _make_local_freeze(global_latents, global_mask, chunk_start, prev_anchor_latents, first_chunk, last_chunk):
                 local_latents = torch.zeros(16, chunk_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
                 local_mask = torch.zeros(chunk_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
+                endpoint_zero_mask = torch.zeros(chunk_latent_frames, device=device, dtype=torch.bool)
+
+                def _place_endpoint(anchor_latents, anchor_frame_count, global_frame_start, label, hold_to_chunk_end=False):
+                    if anchor_latents is None or anchor_frame_count <= 0 or endpoint_strength <= 0.0:
+                        return
+                    local_frame_start = int(global_frame_start) - int(chunk_start)
+                    local_frame_end = local_frame_start + int(anchor_frame_count)
+                    if local_frame_start < 0 or local_frame_end > chunk_frames:
+                        raise ValueError(
+                            f"SCAIL-2 {label} endpoint [{global_frame_start}, {global_frame_start + anchor_frame_count}) "
+                            f"does not fit chunk [{chunk_start}, {chunk_start + chunk_frames})"
+                        )
+                    if label == "end" and not first_chunk and local_frame_start < prev_frame_count:
+                        raise ValueError(
+                            "SCAIL-2 end endpoint overlaps the final chunk's 5-frame handoff. "
+                            "Increase num_frames by 4 or use a smaller endpoint_frame_count."
+                        )
+                    frame_mask = torch.zeros(chunk_frames, device=device, dtype=dtype)
+                    frame_mask[local_frame_start:local_frame_end] = 1.0
+                    latent_mask = _frame_mask_to_latent_mask(frame_mask, chunk_latent_frames) > 0
+                    indices = latent_mask.nonzero(as_tuple=True)[0]
+                    anchor = _resize_latent_spatial(anchor_latents.to(device, dtype), lat_h, lat_w)
+                    copy_len = min(int(indices.numel()), int(anchor.shape[1]))
+                    if copy_len <= 0:
+                        return
+                    indices = indices[:copy_len]
+                    local_latents[:, indices] = anchor[:, :copy_len]
+                    strength = torch.full(
+                        (copy_len, lat_h, lat_w), endpoint_strength, device=device, dtype=dtype
+                    )
+                    local_mask[indices] = torch.maximum(local_mask[indices], strength)
+                    endpoint_zero_mask[indices] = True
+                    log.info(
+                        "SCAIL-2 %s endpoint in chunk %d: global pixels [%d, %d], local pixels [%d, %d], latent indices %s",
+                        label,
+                        chunk_start,
+                        global_frame_start,
+                        global_frame_start + anchor_frame_count - 1,
+                        local_frame_start,
+                        local_frame_end - 1,
+                        indices.tolist(),
+                    )
+                    if hold_to_chunk_end:
+                        hold_start = int(indices[-1].item()) + 1
+                        if hold_start < chunk_latent_frames:
+                            local_latents[:, hold_start:] = anchor[:, copy_len - 1:copy_len].expand(
+                                -1, chunk_latent_frames - hold_start, -1, -1
+                            )
+                            local_mask[hold_start:] = torch.maximum(
+                                local_mask[hold_start:],
+                                torch.full_like(local_mask[hold_start:], endpoint_strength),
+                            )
+                            endpoint_zero_mask[hold_start:] = True
 
                 if first_chunk and global_latents is not None:
                     g_lat = _fit_latent_time(global_latents.to(device, dtype), chunk_latent_frames)
@@ -3599,6 +3657,9 @@ class WanVideoSampler:
                             )[0, 0]
                         local_mask[:copy_len] = torch.maximum(local_mask[:copy_len], g_mask[:copy_len])
 
+                if first_chunk:
+                    _place_endpoint(start_anchor_latents_global, start_anchor_frame_count, 0, "start")
+
                 if prev_anchor_latents is not None:
                     anchor = _fit_latent_time(prev_anchor_latents.to(device, dtype), prev_latent_count)
                     anchor = _resize_latent_spatial(anchor, lat_h, lat_w)
@@ -3606,9 +3667,19 @@ class WanVideoSampler:
                     local_latents[:, :copy_len] = anchor[:, :copy_len]
                     local_mask[:copy_len] = 1.0
 
+                if last_chunk:
+                    end_global_start = requested_output_frames - end_anchor_frame_count
+                    _place_endpoint(
+                        end_anchor_latents_global,
+                        end_anchor_frame_count,
+                        end_global_start,
+                        "end",
+                        hold_to_chunk_end=True,
+                    )
+
                 if local_mask.any():
-                    return local_latents, local_mask
-                return None, None
+                    return local_latents, local_mask, endpoint_zero_mask
+                return None, None, None
 
             def _expand_local_freeze_mask(local_mask, channels, strength=1.0):
                 if local_mask is None:
@@ -3637,14 +3708,21 @@ class WanVideoSampler:
                     "scail_mask": local_mask,
                 }
 
-            def _make_local_freeze_state(freeze_base, strength, channels):
+            def _make_local_freeze_state(freeze_base, strength, channels, protected_time_mask=None):
                 if freeze_base is None:
                     return None
                 strength = max(0.0, min(1.0, float(strength)))
-                if strength <= 0.0:
+                has_protected = protected_time_mask is not None and bool(protected_time_mask.any())
+                if strength <= 0.0 and not has_protected:
                     return None
                 latent_mask = (freeze_base["latent_mask"] * strength).clamp(0.0, 1.0)
                 scail_mask = (freeze_base["scail_mask"] * strength).clamp(0.0, 1.0)
+                if protected_time_mask is not None:
+                    protected_time_mask = protected_time_mask.to(device=device, dtype=torch.bool)
+                    latent_protected = protected_time_mask.view(1, -1, 1, 1)
+                    scail_protected = protected_time_mask.view(-1, 1, 1)
+                    latent_mask = torch.where(latent_protected, freeze_base["latent_mask"], latent_mask)
+                    scail_mask = torch.where(scail_protected, freeze_base["scail_mask"], scail_mask)
                 return {
                     "frozen_part": freeze_base["latents"] * latent_mask,
                     "inverse_mask": 1.0 - latent_mask,
@@ -3661,7 +3739,7 @@ class WanVideoSampler:
                     inverse_mask = inverse_mask.to(latent_in)
                 return frozen_part + latent_in * inverse_mask
 
-            def _build_chunk_scail_data(base_scail_data, chunk_start, local_freeze_mask, first_chunk):
+            def _build_chunk_scail_data(base_scail_data, chunk_start, local_freeze_mask, endpoint_zero_mask, first_chunk):
                 chunk_data = base_scail_data.copy() if base_scail_data is not None else {}
                 chunk_latent_start = chunk_start // 4
                 zero_mask_source = scail_condition_zero_mask_global if first_chunk else None
@@ -3678,6 +3756,11 @@ class WanVideoSampler:
                         chunk_start,
                         keep_mask=scail_transition_keep_mask_global,
                     )
+                    if endpoint_zero_mask is not None:
+                        if pose_zero_mask is None:
+                            pose_zero_mask = endpoint_zero_mask.clone()
+                        else:
+                            pose_zero_mask |= endpoint_zero_mask
                     pose_latent = _zero_condition_latents(pose_latent, pose_zero_mask)
                     chunk_data["pose_latent"] = pose_latent
                 else:
@@ -3697,6 +3780,11 @@ class WanVideoSampler:
                     )
                     if sam_zero_mask is not None and sam_keep_mask is not None:
                         sam_zero_mask &= ~sam_keep_mask
+                    if endpoint_zero_mask is not None:
+                        if sam_zero_mask is None:
+                            sam_zero_mask = endpoint_zero_mask.clone()
+                        else:
+                            sam_zero_mask |= endpoint_zero_mask
                     sam_latents = _zero_condition_latents(sam_latents, sam_zero_mask)
                     chunk_data["sam_latents"] = sam_latents
                 else:
@@ -3866,30 +3954,49 @@ class WanVideoSampler:
                         generator=chunk_generator,
                         device=torch.device("cpu"),
                     ).to(device)
-                    local_freeze_latents, local_freeze_mask = _make_local_freeze(
+                    local_freeze_latents, local_freeze_mask, local_endpoint_zero_mask = _make_local_freeze(
                         freeze_latents_global,
                         freeze_mask_global,
                         chunk_start,
                         prev_anchor_latents,
                         chunk_idx == 0,
+                        chunk_idx + 1 == num_chunks,
                     )
                     if chunk_idx > 0:
                         prev_anchor_latents = None
 
                     freeze_base = _make_local_freeze_base(local_freeze_latents, local_freeze_mask, latent)
-                    full_freeze_state = _make_local_freeze_state(freeze_base, 1.0, latent.shape[0])
+                    full_freeze_state = _make_local_freeze_state(
+                        freeze_base, 1.0, latent.shape[0], local_endpoint_zero_mask
+                    )
                     phase1_freeze_state = (
-                        _make_local_freeze_state(freeze_base, scail2_two_phase_phase1_mask, latent.shape[0])
+                        _make_local_freeze_state(
+                            freeze_base,
+                            scail2_two_phase_phase1_mask,
+                            latent.shape[0],
+                            local_endpoint_zero_mask,
+                        )
                         if chunk_two_phase else None
                     )
                     phase2_freeze_state = (
-                        _make_local_freeze_state(freeze_base, scail2_two_phase_phase2_mask, latent.shape[0])
+                        _make_local_freeze_state(
+                            freeze_base,
+                            scail2_two_phase_phase2_mask,
+                            latent.shape[0],
+                            local_endpoint_zero_mask,
+                        )
                         if chunk_two_phase else None
                     )
                     if full_freeze_state is not None:
                         latent = _apply_local_freeze_state(latent, full_freeze_state).detach()
 
-                    local_scail_data = _build_chunk_scail_data(scail_data, chunk_start, local_freeze_mask, chunk_idx == 0)
+                    local_scail_data = _build_chunk_scail_data(
+                        scail_data,
+                        chunk_start,
+                        local_freeze_mask,
+                        local_endpoint_zero_mask,
+                        chunk_idx == 0,
+                    )
                     local_scail_data = dict_to_device(local_scail_data, device, dtype)
                     local_uni3c_data = _build_chunk_uni3c_data(chunk_start, chunk_idx == 0)
                     local_scail_freeze_mask = full_freeze_state["scail_mask"] if full_freeze_state is not None else None
@@ -3967,6 +4074,7 @@ class WanVideoSampler:
                         local_uni3c_data,
                         local_freeze_latents,
                         local_freeze_mask,
+                        local_endpoint_zero_mask,
                         local_scail_freeze_mask,
                         freeze_base,
                         full_freeze_state,

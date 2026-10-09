@@ -219,6 +219,8 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 | `single_frame_prefix_encoding` | 将 `prefix_frames` 编码为独立的全分辨率 reference latents，而不是扩展画布；默认开启 |
 | `prefix_frames` | 可选 prefix 图像。默认单帧模式下会成为 reference-stream latents；关闭单帧模式后才硬冻结到前置画布 |
 | `transition_video` | 可选，硬冻结在 latent 序列前部的 transition 帧 |
+| `start_anchor_frames` / `end_anchor_frames` | 可选 FLF2V 风格首尾时序锚点；将同一组 `4n+1` 帧同时连接到两端可生成首尾一致的独立片段 |
+| `endpoint_frame_count` / `endpoint_strength` | 锚点最多使用帧数与 latent 锁定强度；推荐 `5` / `1.0` |
 | `clip_embeds` | 可选，来自 `WanAnimatePlus ClipVisionEncode` 的 CLIP vision 特征 |
 | `force_offload` / `tiled_vae` | VAE 编码相关显存控制 |
 
@@ -229,6 +231,8 @@ WanAnimatePlus 暴露了一套完整工作流链路，用于避免与原版 WanV
 SCAIL-2 默认的 `single_frame_prefix_encoding` 模式不会因为 `prefix_frames` 扩展或裁剪输出。如果连接 `transition_video`，前置画布会扩展 21 个像素帧，解码后裁掉这 21 帧。关闭 `single_frame_prefix_encoding` 后，`prefix_frames` 使用 legacy 37 前置像素帧画布；同时连接 `transition_video` 时，transition 帧放在第 17-36 帧。
 
 animation 模式下连接 `bg_image` 时，节点会为该背景图内部添加白色 mask。用户提供的 `prefix_frames` 和 `prefix_mask` 各自最多保留四张，让背景图占用剩余的 reference/prefix 容量。replacement 模式下 `bg_image` 会被忽略。
+
+首尾锚点在采样过程中作为冻结 latent 参与去噪，不是解码后贴帧。长视频分窗模式只在首窗放入 start anchor、在末窗放入 end anchor，并将实际输出尾帧之后的隐藏 latent 保持为末态，避免模型看到随机未来。锚点会自动关闭后处理色彩匹配，不能与 `transition_video` 同时连接，并要求 `single_frame_prefix_encoding=True`。输入帧数会向下规范为 `4n+1`；推荐使用 5 帧并让驱动 pose 的首尾动作与锚点一致。
 
 ### WanAnimatePlus SCAIL_2 Flow Embeds / Flow Sampler / VAE Decode
 
