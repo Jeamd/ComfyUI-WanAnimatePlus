@@ -232,7 +232,7 @@ For SCAIL-2, the default `single_frame_prefix_encoding` mode does not expand or 
 
 When `bg_image` is connected in animation mode, the node internally adds a white mask for that background image. User-provided `prefix_frames` and `prefix_mask` are limited to four images each so the background can occupy the remaining reference/prefix capacity. In replacement mode, `bg_image` is ignored.
 
-Endpoint anchors participate in denoising as frozen latents; they are not pasted onto decoded output. In long-video loop mode the start anchor is placed only in the first chunk, the end anchor only in the final chunk, and hidden latents after the requested endpoint are held at the final anchor state so the model does not see a random future. Endpoint mode disables post-decode color matching, cannot be combined with `transition_video`, and requires `single_frame_prefix_encoding=True`. Anchor input is normalized down to `4n+1` frames; use 5 frames and matching start/end driving poses for the first test.
+Endpoint anchors participate in denoising as frozen latents; they are not pasted onto decoded output. In long-video loop mode the start anchor is placed only in the first chunk and the end anchor only in the final chunk. The final chunk is shortened to the remaining output length so the end anchor lands at the real window boundary without hidden future frames. Endpoint mode disables post-decode color matching, cannot be combined with `transition_video`, and requires `single_frame_prefix_encoding=True`. Anchor input is normalized down to `4n+1` frames; use 5 frames and matching start/end driving poses for the first test.
 
 ### WanAnimatePlus SCAIL_2 Flow Embeds / Flow Sampler / VAE Decode
 

@@ -232,7 +232,7 @@ SCAIL-2 默认的 `single_frame_prefix_encoding` 模式不会因为 `prefix_fram
 
 animation 模式下连接 `bg_image` 时，节点会为该背景图内部添加白色 mask。用户提供的 `prefix_frames` 和 `prefix_mask` 各自最多保留四张，让背景图占用剩余的 reference/prefix 容量。replacement 模式下 `bg_image` 会被忽略。
 
-首尾锚点在采样过程中作为冻结 latent 参与去噪，不是解码后贴帧。长视频分窗模式只在首窗放入 start anchor、在末窗放入 end anchor，并将实际输出尾帧之后的隐藏 latent 保持为末态，避免模型看到随机未来。锚点会自动关闭后处理色彩匹配，不能与 `transition_video` 同时连接，并要求 `single_frame_prefix_encoding=True`。输入帧数会向下规范为 `4n+1`；推荐使用 5 帧并让驱动 pose 的首尾动作与锚点一致。
+首尾锚点在采样过程中作为冻结 latent 参与去噪，不是解码后贴帧。长视频分窗模式只在首窗放入 start anchor、在末窗放入 end anchor；末窗会按剩余的实际帧数缩短，使 end anchor 正好位于窗口末端，避免额外隐藏帧干扰。锚点会自动关闭后处理色彩匹配，不能与 `transition_video` 同时连接，并要求 `single_frame_prefix_encoding=True`。输入帧数会向下规范为 `4n+1`；推荐使用 5 帧并让驱动 pose 的首尾动作与锚点一致。
 
 ### WanAnimatePlus SCAIL_2 Flow Embeds / Flow Sampler / VAE Decode
 

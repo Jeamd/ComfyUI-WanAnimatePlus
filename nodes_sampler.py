@@ -2974,17 +2974,18 @@ class WanVideoSampler:
 
             requested_output_frames = int(scail2_requested_frames)
             total_generation_frames = int(num_frames)
-            chunk_frames = int(image_embeds.get("scail2_frame_window_size", frame_window_size))
-            chunk_frames = ((chunk_frames - 1) // 4) * 4 + 1
+            window_chunk_frames = int(image_embeds.get("scail2_frame_window_size", frame_window_size))
+            window_chunk_frames = ((window_chunk_frames - 1) // 4) * 4 + 1
             prev_frame_count = int(scail2_previous_frame_count)
             if prev_frame_count <= 0:
                 raise ValueError("SCAIL-2 previous frame count must be positive")
-            if chunk_frames <= prev_frame_count:
+            if window_chunk_frames <= prev_frame_count:
                 raise ValueError("SCAIL-2 frame_window_size must be larger than the 5-frame handoff")
-            stride_frames = chunk_frames - prev_frame_count
-            chunk_latent_frames = (chunk_frames - 1) // 4 + 1
+            stride_frames = window_chunk_frames - prev_frame_count
+            chunk_frames = window_chunk_frames
+            chunk_latent_frames = (window_chunk_frames - 1) // 4 + 1
             prev_latent_count = (prev_frame_count - 1) // 4 + 1
-            num_chunks = 1 if total_generation_frames <= chunk_frames else math.ceil((total_generation_frames - chunk_frames) / stride_frames) + 1
+            num_chunks = 1 if total_generation_frames <= window_chunk_frames else math.ceil((total_generation_frames - window_chunk_frames) / stride_frames) + 1
 
             lat_h = int(image_embeds.get("lat_h", noise.shape[2]))
             lat_w = int(image_embeds.get("lat_w", noise.shape[3]))
@@ -3580,7 +3581,7 @@ class WanVideoSampler:
                 local_mask = torch.zeros(chunk_latent_frames, lat_h, lat_w, device=device, dtype=dtype)
                 endpoint_zero_mask = torch.zeros(chunk_latent_frames, device=device, dtype=torch.bool)
 
-                def _place_endpoint(anchor_latents, anchor_frame_count, global_frame_start, label, hold_to_chunk_end=False):
+                def _place_endpoint(anchor_latents, anchor_frame_count, global_frame_start, label):
                     if anchor_latents is None or anchor_frame_count <= 0 or endpoint_strength <= 0.0:
                         return
                     local_frame_start = int(global_frame_start) - int(chunk_start)
@@ -3620,17 +3621,6 @@ class WanVideoSampler:
                         local_frame_end - 1,
                         indices.tolist(),
                     )
-                    if hold_to_chunk_end:
-                        hold_start = int(indices[-1].item()) + 1
-                        if hold_start < chunk_latent_frames:
-                            local_latents[:, hold_start:] = anchor[:, copy_len - 1:copy_len].expand(
-                                -1, chunk_latent_frames - hold_start, -1, -1
-                            )
-                            local_mask[hold_start:] = torch.maximum(
-                                local_mask[hold_start:],
-                                torch.full_like(local_mask[hold_start:], endpoint_strength),
-                            )
-                            endpoint_zero_mask[hold_start:] = True
 
                 if first_chunk and global_latents is not None:
                     g_lat = _fit_latent_time(global_latents.to(device, dtype), chunk_latent_frames)
@@ -3669,13 +3659,7 @@ class WanVideoSampler:
 
                 if last_chunk:
                     end_global_start = requested_output_frames - end_anchor_frame_count
-                    _place_endpoint(
-                        end_anchor_latents_global,
-                        end_anchor_frame_count,
-                        end_global_start,
-                        "end",
-                        hold_to_chunk_end=True,
-                    )
+                    _place_endpoint(end_anchor_latents_global, end_anchor_frame_count, end_global_start, "end")
 
                 if local_mask.any():
                     return local_latents, local_mask, endpoint_zero_mask
@@ -3851,21 +3835,23 @@ class WanVideoSampler:
                 _maybe_offload_loop_vae()
                 return anchor_latent
 
-            if "comfy" in rope_function:
-                transformer.rope_embedder.num_frames = chunk_latent_frames
-                transformer.cached_freqs = None
-                if hasattr(transformer, "cached_key"):
-                    transformer.cached_key = None
-            elif context_latents is None and "default" in rope_function:
-                freqs = torch.cat([
-                    rope_params(1024, d - 4 * (d // 6), L_test=chunk_latent_frames, k=riflex_freq_index),
-                    rope_params(1024, 2 * (d // 6)),
-                    rope_params(1024, 2 * (d // 6)),
-                ], dim=1)
+            def _configure_chunk_rope(active_chunk_latent_frames):
+                nonlocal freqs
+                if "comfy" in rope_function:
+                    transformer.rope_embedder.num_frames = active_chunk_latent_frames
+                    transformer.cached_freqs = None
+                    if hasattr(transformer, "cached_key"):
+                        transformer.cached_key = None
+                elif context_latents is None and "default" in rope_function:
+                    freqs = torch.cat([
+                        rope_params(1024, d - 4 * (d // 6), L_test=active_chunk_latent_frames, k=riflex_freq_index),
+                        rope_params(1024, 2 * (d // 6)),
+                        rope_params(1024, 2 * (d // 6)),
+                    ], dim=1)
 
             log.info(
                 f"SCAIL-2 loop sampling: {requested_output_frames} requested frames, {total_generation_frames} canvas frames, {num_chunks} chunks, "
-                f"{chunk_frames} frames/chunk, stride {stride_frames}, {prev_frame_count} frame handoff"
+                f"up to {window_chunk_frames} frames/chunk, stride {stride_frames}, {prev_frame_count} frame handoff"
             )
 
             callback = prepare_callback(patcher, num_chunks * len(timesteps))
@@ -3907,11 +3893,23 @@ class WanVideoSampler:
             try:
                 for chunk_idx in range(num_chunks):
                     chunk_start = chunk_idx * stride_frames
+                    chunk_frames = min(window_chunk_frames, total_generation_frames - chunk_start)
+                    chunk_frames = ((chunk_frames - 1) // 4) * 4 + 1
+                    if chunk_frames <= prev_frame_count and chunk_idx > 0:
+                        raise ValueError(
+                            f"SCAIL-2 final chunk has only {chunk_frames} frames, which is not larger than "
+                            f"the {prev_frame_count}-frame handoff"
+                        )
+                    chunk_latent_frames = (chunk_frames - 1) // 4 + 1
+                    _configure_chunk_rope(chunk_latent_frames)
                     chunk_seed = int.from_bytes(os.urandom(8), "little")
                     chunk_seeds.append(chunk_seed)
                     chunk_generator = torch.Generator(device=torch.device("cpu"))
                     chunk_generator.manual_seed(chunk_seed)
-                    log.info(f"SCAIL-2 chunk {chunk_idx + 1}/{num_chunks}: start={chunk_start}, seed={chunk_seed}")
+                    log.info(
+                        f"SCAIL-2 chunk {chunk_idx + 1}/{num_chunks}: start={chunk_start}, "
+                        f"frames={chunk_frames}, seed={chunk_seed}"
+                    )
 
                     if isinstance(scheduler, dict):
                         chunk_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
